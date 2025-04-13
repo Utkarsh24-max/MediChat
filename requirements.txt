@@ -10,3 +10,4 @@ langchain-core
 langchain-community
 langchain-huggingface
 faiss-cpu
+gunicorn
