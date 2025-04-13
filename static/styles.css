@@ -1,0 +1,257 @@
+/* LIGHT MODE VARIABLES – ChatGPT-inspired with a medical twist */
+:root {
+  --primary: #0d9488;       /* Soothing teal accent */
+  --bg: #f7f9fa;            /* Light, airy background */
+  --header-bg: rgba(255, 255, 255, 0.7); /* Semi-transparent white for glass effect */
+  --input-bg: rgba(255, 255, 255, 0.7);  /* Semi-transparent for input area */
+  --text: #202123;          /* Dark grey for legibility */
+  --border: #e5e7ea;        /* Soft border color */
+  --note: #6b7280;          /* Muted note color */
+  --heading-accent: #0b79a1; /* A cool blue accent for headings */
+}
+
+/* DARK MODE VARIABLES – Modern slate with subtle accents */
+.dark-mode {
+  --primary: #0e7c7b;
+  --bg: #202123;
+  --header-bg: rgba(52, 53, 65, 0.7);
+  --input-bg: rgba(52, 53, 65, 0.7);
+  --text: #e5e5ea;
+  --border: #3e4042;
+  --note: #9ca3af;
+  --heading-accent: #4a90e2;
+}
+
+/* Override the dark mode text for the dark mode toggle label */
+.dark-mode #mode-text {
+  color: #ffffff;
+}
+
+/* Invert the logos to white in dark mode */
+.dark-mode .icon,
+.dark-mode .bot-icon {
+  filter: brightness(0) invert(1);
+}
+
+/* Global Reset & Typography */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Roboto', sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* HEADER with Acrylic Glass Feel */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 2rem;
+  background-color: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.icon {
+  width: 50px;
+  height: 50px;
+}
+
+.header-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.subtitle {
+  font-size: 0.9rem;
+  color: var(--note);
+  margin-top: 0.25rem;
+}
+
+/* Toggle Slider Styles */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 50px;
+  height: 24px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #ccc;
+  transition: .4s;
+  border-radius: 34px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .4s;
+  border-radius: 50%;
+}
+
+input:checked + .slider {
+  background-color: var(--primary);
+}
+
+input:checked + .slider:before {
+  transform: translateX(26px);
+}
+
+/* CHAT AREA */
+.chat-container {
+  flex: 1;
+  padding: 1rem 2rem;
+  overflow-y: auto;
+  background-color: var(--bg);
+  scroll-behavior: smooth;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.message {
+  max-width: 75%;
+  padding: 0.8rem 1rem;
+  border-radius: 1.2rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  display: flex;
+  gap: 0.5rem;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
+.bot .message-text {
+  color: var(--text);
+}
+
+.user {
+  background-color: var(--primary);
+  color: white;
+  align-self: flex-end;
+}
+
+.bot-icon {
+  width: 30px;
+  height: 30px;
+  margin-top: 0.5rem;
+}
+
+/* INPUT BAR with Acrylic Glass Feel */
+.input-area {
+  display: flex;
+  align-items: center;
+  padding: 0.75rem 2rem;
+  border-top: 1px solid var(--border);
+  background-color: var(--input-bg);
+  backdrop-filter: blur(10px);
+}
+
+#user-input {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  outline: none;
+  font-size: 1rem;
+  background-color: transparent;
+  color: var(--text);
+}
+
+.send-button {
+  margin-left: 1rem;
+  padding: 0.75rem 1.5rem;
+  border-radius: 999px;
+  border: none;
+  background-color: var(--primary);
+  color: white;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.send-button:hover {
+  background-color: #1669c1;
+}
+
+/* NOTE */
+.note {
+  font-size: 0.75rem;
+  text-align: center;
+  color: var(--note);
+  margin: 0.5rem 0;
+}
+
+/* Collapsible details section styles */
+.toggle-btn {
+  background-color: var(--primary);
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 5px;
+  cursor: pointer;
+  margin-top: 10px;
+}
+
+.toggle-btn:hover {
+  background-color: #1669c1;
+}
+
+.disease-details {
+  border: 1px solid var(--border);
+  padding: 1rem;
+  border-radius: 5px;
+  background-color: var(--header-bg);
+  display: none;
+}
+
+/* Headings in disease details */
+.disease-details h1,
+.disease-details h2,
+.disease-details h3,
+.disease-details h4,
+.disease-details h5,
+.disease-details h6 {
+  color: var(--heading-accent);
+}

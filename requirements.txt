@@ -1,0 +1,12 @@
+flask
+requests
+torch
+markdown
+pymongo
+python-dotenv
+transformers
+langchain
+langchain-core
+langchain-community
+langchain-huggingface
+faiss-cpu
