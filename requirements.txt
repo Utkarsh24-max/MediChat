@@ -5,6 +5,7 @@ markdown
 pymongo
 python-dotenv
 transformers
+sentence-transformers
 langchain
 langchain-core
 langchain-community

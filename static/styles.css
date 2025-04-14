@@ -1,5 +1,5 @@
-/* LIGHT MODE VARIABLES – ChatGPT-inspired with a medical twist */
-:root {
+ /* LIGHT MODE VARIABLES – ChatGPT-inspired with a medical twist */
+ :root {
   --primary: #0d9488;       /* Soothing teal accent */
   --bg: #f7f9fa;            /* Light, airy background */
   --header-bg: rgba(255, 255, 255, 0.7); /* Semi-transparent white for glass effect */
@@ -113,7 +113,10 @@ body {
 .slider {
   position: absolute;
   cursor: pointer;
-  top: 0; left: 0; right: 0; bottom: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
   background-color: #ccc;
   transition: .4s;
   border-radius: 34px;
@@ -254,4 +257,49 @@ input:checked + .slider:before {
 .disease-details h5,
 .disease-details h6 {
   color: var(--heading-accent);
+}
+
+/* Jumping Dots Loading Indicator */
+.jumping-dots {
+  display: inline-block;
+}
+
+.jumping-dots span {
+  position: relative;
+  display: inline-block;
+  margin: 0 5px;
+  animation: jump 1s infinite;
+}
+
+.jumping-dots .dot-1,
+.jumping-dots .dot-2,
+.jumping-dots .dot-3 {
+  background-color: #000;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+/* Dark mode override for jumping dots */
+.dark-mode .jumping-dots .dot-1,
+.dark-mode .jumping-dots .dot-2,
+.dark-mode .jumping-dots .dot-3 {
+  background-color: #ffffff;
+}
+
+.jumping-dots .dot-1 {
+  animation-delay: 0.2s;
+}
+.jumping-dots .dot-2 {
+  animation-delay: 0.4s;
+}
+.jumping-dots .dot-3 {
+  animation-delay: 0.6s;
+}
+
+@keyframes jump {
+  0%   { bottom: 0px; }
+  20%  { bottom: 8px; }
+  40%  { bottom: 0px; }
+  100% { bottom: 0px; }
 }
