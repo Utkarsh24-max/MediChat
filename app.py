@@ -4,6 +4,9 @@ import time
 import markdown
 import requests
 import httpx
+import functools
+import hashlib
+
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -21,6 +24,20 @@ from pydantic import Field
 
 load_dotenv()
 
+# --- Simple Cache Decorator ---
+cache = {}
+
+def cache_llm(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        key_raw = (args, kwargs)
+        key = hashlib.sha256(repr(key_raw).encode('utf-8')).hexdigest()
+        if key in cache:
+            return cache[key]
+        result = func(*args, **kwargs)
+        cache[key] = result
+        return result
+    return wrapper
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "a_very_secret_key")
@@ -50,25 +67,26 @@ def markdown_to_plain_text(md_text: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text()
 
 # --- Retry mechanism for Gradio client initialization (for symptom and disease prediction) ---
+# --- Retry mechanism for Gradio client initialization (for symptom and disease prediction) ---
 def get_gradio_client(client_id: str, max_retries: int = 3, delay: int = 5):
     for attempt in range(max_retries):
         try:
+            # (Optionally, if the Client supports a timeout parameter,
+            # you can add something like: Client(client_id, timeout=30))
             client = Client(client_id)
-            # Print for non-FAISS clients only.
             if "faiss" not in client_id.lower():
                 print(f"Loaded as API: {client_id} ✔")
             return client
-        except httpx.ConnectTimeout as e:
+        except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             print(f"Attempt {attempt + 1} for {client_id} timed out: {e}. Retrying in {delay} seconds...")
             time.sleep(delay)
     raise RuntimeError(f"Could not load {client_id} after {max_retries} attempts.")
 
+
 # Initialize Gradio clients for symptom and disease prediction.
 symptom_client = get_gradio_client("samratray/my_bert_space1")
 disease_client = get_gradio_client("samratray/my_bert_space2")
-
-# Initialize Gradio client for FAISS search.
-faiss_client = Client("samratray/faiss")  # This client initialization does not print to terminal.
+faiss_client = Client("samratray/faiss")  # For FAISS search.
 
 def classify_symptoms_api(text: str, threshold: float = 0.8):
     return symptom_client.predict(text=text, threshold=threshold, api_name="/predict")
@@ -90,6 +108,7 @@ class Gemma2LLM(BaseLLM):
     def _llm_type(self) -> str:
         return "gemma2"
     
+    @cache_llm
     def _generate(self, prompts: list[str], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None) -> LLMResult:
         api_key = os.getenv("GROQ_API_KEY")
@@ -99,11 +118,22 @@ class Gemma2LLM(BaseLLM):
         url = "https://api.groq.com/openai/v1/chat/completions"
         generations = []
         for prompt in prompts:
-            payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
-            response = self.req_session.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            generations.append(ChatGeneration(message=AIMessage(content=content), generation_info={}))
+            # Minimal debouncing: wait a small amount before each call.
+            time.sleep(0.3)
+            for attempt in range(2):  # Try up to 2 times per prompt.
+                try:
+                    payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
+                    response = self.req_session.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    content = response.json()["choices"][0]["message"]["content"]
+                    generations.append(ChatGeneration(message=AIMessage(content=content), generation_info={}))
+                    break  # Exit retry loop on success.
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 429:
+                        print(f"Rate limited. Attempt {attempt+1} for prompt: {prompt}")
+                        time.sleep(1)  # Slight delay before retrying.
+                    else:
+                        raise
         return LLMResult(generations=[[g] for g in generations])
     
     class Config:
@@ -118,9 +148,7 @@ llm_for_qa = Gemma2LLM()
 # ---------------------------
 class DummyRetriever(BaseRetriever):
     def get_relevant_documents(self, query: str):
-        # Return an empty list when no actual retrieval is required.
         return []
-
     @property
     def search_kwargs(self) -> dict:
         return {}
@@ -138,14 +166,12 @@ QA_PROMPT = PromptTemplate(template=prompt_template, input_variables=["context",
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm_for_qa,
     chain_type="stuff",
-    retriever=DummyRetriever(),  # Using DummyRetriever to satisfy the API requirement.
+    retriever=DummyRetriever(),
     return_source_documents=True,
     chain_type_kwargs={"prompt": QA_PROMPT}
 )
 
 def route_query_llm(text: str) -> dict:
-    lower_text = text.lower()
-    
     prompt = (
         "You are a routing agent. Decide if the query is related to medical symptoms (for disease prediction) "
         "or if it is a general query.\n"
@@ -167,20 +193,13 @@ def compute_decision_from_explanation(explanation: str) -> bool:
         f"Explanation: {explanation}\n\n"
         "Answer with a single word: Reply only 'Likely' if they do or 'Less Likely' if they do not."
     )
-    
     try:
         decision_result = llm_explanation._generate([prompt_decision])
         output = decision_result.generations[0][0].message.content.strip().lower()
     except Exception as e:
         print(f"LLM call for decision failed: {e}")
         return False
-
-    if output.startswith("likely"):
-        return True
-    elif output.startswith("less likely"):
-        return False
-    else:
-        return False
+    return output.startswith("likely")
 
 def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) -> (str, bool):
     prompt_explanation = (
@@ -198,13 +217,9 @@ def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) ->
     return explanation_text, decision
 
 # ---------------------------
-# Helper: Call FAISS Space API using the Gradio client
+# Helper: Call FAISS API using the Gradio client
 # ---------------------------
 def call_faiss_api(query: str) -> str:
-    """
-    Uses the Gradio client to call the FAISS search API exposed at the endpoint /faiss_search.
-    It accepts a query string and returns the retrieved documents as a plain text string.
-    """
     try:
         result = faiss_client.predict(query=query, api_name="/faiss_search")
         return result
@@ -216,21 +231,23 @@ def call_faiss_api(query: str) -> str:
 # ---------------------------
 @app.route("/")
 def index():
-    session.clear()
+    # Initialize history as an empty list.
+    session["chat_history"] = []
     return render_template("index.html")
 
 @app.route("/chat", methods=["POST"])
 def chat():
     user_input = request.json.get("message", "")
     cleaned_text = clean_text(user_input)
-    chat_history = session.get("chat_history", "")
-    chat_history += f"User: {user_input}\n"
-
-    # Determine type of query.
-    route_info = route_query_llm(user_input)
-    structured_query = f"Conversation History:\n{chat_history}\nUser Query: {user_input}"
-
-    if route_info["branch"] == "disease_prediction":
+    # Use chat history as a list.
+    chat_history = session.get("chat_history", [])
+    chat_history.append(f"User: {user_input}")
+    
+    # Only use the last five exchanges (each exchange may be one line).
+    recent_history = chat_history[-5:]
+    structured_query = "Conversation History:\n" + "\n".join(recent_history) + f"\nUser Query: {user_input}"
+    
+    if route_query_llm(user_input)["branch"] == "disease_prediction":
         try:
             raw_symptoms = classify_symptoms_api(cleaned_text)
         except Exception as ex:
@@ -291,7 +308,7 @@ def chat():
                 """
             response_text = f"Based on your symptoms, possible conditions are:<br><br>{diseases_html}"
         else:
-            # Call the FAISS API as additional context retrieval.
+            # Use FAISS API as additional context retrieval.
             faiss_context = call_faiss_api(user_input)
             structured_query += f"\n\nContext from FAISS:\n{faiss_context}"
             qa_result = qa_chain.invoke({"query": structured_query})
@@ -304,12 +321,13 @@ def chat():
         qa_result = qa_chain.invoke({"query": structured_query})
         answer = qa_result.get("result", "I'm sorry, I couldn't find an answer.")
         response_text = markdown.markdown(answer)
-
-    # Clean the bot response (remove HTML tags) before adding it to the chat history.
+    
+    # Remove HTML from bot response for logging.
     clean_response = markdown_to_plain_text(response_text)
-    chat_history += f"Bot: {clean_response}\n"
-    session["chat_history"] = chat_history
-
+    chat_history.append(f"Bot: {clean_response}")
+    # Keep only the last 5 exchanges.
+    session["chat_history"] = chat_history[-5:]
+    
     return jsonify(response=response_text)
 
 @app.route("/reset", methods=["GET"])

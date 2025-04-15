@@ -9,4 +9,5 @@ httpx
 langchain
 langchain-huggingface
 pydantic
+Flask-Session
 gunicorn
