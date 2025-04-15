@@ -14,13 +14,11 @@ from langchain_core.language_models import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.outputs import LLMResult
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain.schema import AIMessage, ChatGeneration
+from langchain.schema import AIMessage, ChatGeneration, BaseRetriever, Document
 from pydantic import Field
 
-# -----------------------
 load_dotenv()
 
 app = Flask(__name__)
@@ -45,26 +43,31 @@ _translator = str.maketrans(string.punctuation, " " * len(string.punctuation))
 def clean_text(text: str) -> str:
     return " ".join(text.translate(_translator).split())
 
-# Function to convert Markdown text to clean plain text.
+# Convert Markdown text to plain text.
 def markdown_to_plain_text(md_text: str) -> str:
     html = markdown.markdown(md_text.strip())
     return BeautifulSoup(html, "html.parser").get_text()
 
-# --- Retry mechanism for Gradio client initialization ---
+# --- Retry mechanism for Gradio client initialization (for symptom and disease prediction) ---
 def get_gradio_client(client_id: str, max_retries: int = 3, delay: int = 5):
     for attempt in range(max_retries):
         try:
             client = Client(client_id)
-            print(f"Loaded as API: {client_id} ✔")
+            # Print for non-FAISS clients only.
+            if "faiss" not in client_id.lower():
+                print(f"Loaded as API: {client_id} ✔")
             return client
         except httpx.ConnectTimeout as e:
             print(f"Attempt {attempt + 1} for {client_id} timed out: {e}. Retrying in {delay} seconds...")
             time.sleep(delay)
     raise RuntimeError(f"Could not load {client_id} after {max_retries} attempts.")
 
-# Initialize Gradio clients for symptom and disease prediction with retry.
+# Initialize Gradio clients for symptom and disease prediction.
 symptom_client = get_gradio_client("samratray/my_bert_space1")
 disease_client = get_gradio_client("samratray/my_bert_space2")
+
+# Initialize Gradio client for FAISS search.
+faiss_client = Client("samratray/faiss")  # This client initialization does not print to terminal.
 
 def classify_symptoms_api(text: str, threshold: float = 0.8):
     return symptom_client.predict(text=text, threshold=threshold, api_name="/predict")
@@ -105,20 +108,25 @@ class Gemma2LLM(BaseLLM):
     class Config:
         arbitrary_types_allowed = True
 
-# Instantiate LLMs once.
+# Instantiate LLMs.
 llm_explanation = Gemma2LLM()
 llm_for_qa = Gemma2LLM()
 
-# Setup embeddings and FAISS index (load prebuilt index).
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-index_dir = "faiss_index"
-if os.path.exists(index_dir) and os.listdir(index_dir):
-    vector_store = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
-else:
-    raise RuntimeError("FAISS index not found; build it first")
-retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+# ---------------------------
+# Define a Dummy Retriever to satisfy the RetrievalQA chain.
+# ---------------------------
+class DummyRetriever(BaseRetriever):
+    def get_relevant_documents(self, query: str):
+        # Return an empty list when no actual retrieval is required.
+        return []
 
-# Original prompt template from your working code.
+    @property
+    def search_kwargs(self) -> dict:
+        return {}
+
+# ---------------------------
+# Build a RetrievalQA Chain (for general queries)
+# ---------------------------
 prompt_template = (
     "Use the following context to answer the question in markdown:\n"
     "(Provide a complete answer only if the question is medically related. If the question is outside the medical field, respond with 'I am a Medical Chatbot and am not specialized in other domains. Please stick with my specialized domain.' Always strive to be as helpful as possible within your area of expertise.)\n\n"
@@ -126,22 +134,17 @@ prompt_template = (
 )
 QA_PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
-# Build a RetrievalQA chain.
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm_for_qa,
     chain_type="stuff",
-    retriever=retriever,
+    retriever=DummyRetriever(),  # Using DummyRetriever to satisfy the API requirement.
     return_source_documents=True,
     chain_type_kwargs={"prompt": QA_PROMPT}
 )
 
 def route_query_llm(text: str) -> dict:
-    # Use a simple heuristic if the query mentions key symptoms.
     lower_text = text.lower()
-    if "chest pain" in lower_text or "heart attack" in lower_text or "pain" in lower_text:
-        return {"branch": "disease_prediction", "query": text}
     
-    # Otherwise, use the routing prompt.
     prompt = (
         "You are a routing agent. Decide if the query is related to medical symptoms (for disease prediction) "
         "or if it is a general query.\n"
@@ -158,37 +161,24 @@ def route_query_llm(text: str) -> dict:
     return {"branch": decision, "query": text}
 
 def compute_decision_from_explanation(explanation: str) -> bool:
-    """
-    Determines whether the disease is likely based on the generated explanation.
-    This function makes an LLM call with a custom prompt asking whether the given explanation 
-    supports the disease prediction, expecting a response of either 'Likely' or 'Less Likely'.
-
-    Returns:
-        bool: True if the decision is 'Likely', False otherwise.
-    """
     prompt_decision = (
         "Based on the following explanation of how the symptoms match the disease:\n\n"
         f"Explanation: {explanation}\n\n"
-        "Answer the following question with a single word: Do these symptoms support the disease prediction even a bit? "
-        "Reply only 'Likely' if they do or 'Less Likely' if they do not, with no extra details."
+        "Answer with a single word: Reply only 'Likely' if they do or 'Less Likely' if they do not."
     )
     
     try:
-        # Call the LLM with the new prompt for decision making.
         decision_result = llm_explanation._generate([prompt_decision])
         output = decision_result.generations[0][0].message.content.strip().lower()
     except Exception as e:
-        # In case of an exception, default to a conservative decision.
         print(f"LLM call for decision failed: {e}")
         return False
 
-    # Interpret the LLM output.
     if output.startswith("likely"):
         return True
     elif output.startswith("less likely"):
         return False
     else:
-        # Fallback: if the response is unclear, default to False.
         return False
 
 def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) -> (str, bool):
@@ -206,9 +196,25 @@ def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) ->
     decision = compute_decision_from_explanation(explanation_text)
     return explanation_text, decision
 
+# ---------------------------
+# Helper: Call FAISS Space API using the Gradio client
+# ---------------------------
+def call_faiss_api(query: str) -> str:
+    """
+    Uses the Gradio client to call the FAISS search API exposed at the endpoint /faiss_search.
+    It accepts a query string and returns the retrieved documents as a plain text string.
+    """
+    try:
+        result = faiss_client.predict(query=query, api_name="/faiss_search")
+        return result
+    except Exception as e:
+        return f"Error calling FAISS API: {e}"
+
+# ---------------------------
+# Flask Routes
+# ---------------------------
 @app.route("/")
 def index():
-    # Clear session data so a new session is started on each refresh.
     session.clear()
     return render_template("index.html")
 
@@ -216,12 +222,10 @@ def index():
 def chat():
     user_input = request.json.get("message", "")
     cleaned_text = clean_text(user_input)
-
-    # Retrieve conversation history from session.
     chat_history = session.get("chat_history", "")
     chat_history += f"User: {user_input}\n"
 
-    # Determine query type.
+    # Determine type of query.
     route_info = route_query_llm(user_input)
     structured_query = f"Conversation History:\n{chat_history}\nUser Query: {user_input}"
 
@@ -286,15 +290,23 @@ def chat():
                 """
             response_text = f"Based on your symptoms, possible conditions are:<br><br>{diseases_html}"
         else:
+            # Call the FAISS API as additional context retrieval.
+            faiss_context = call_faiss_api(user_input)
+            structured_query += f"\n\nContext from FAISS:\n{faiss_context}"
             qa_result = qa_chain.invoke({"query": structured_query})
             answer = qa_result.get("result", "I'm sorry, I couldn't find an answer.")
             response_text = markdown.markdown(answer)
     else:
+        # For general queries, include FAISS search context.
+        faiss_context = call_faiss_api(user_input)
+        structured_query += f"\n\nContext from FAISS:\n{faiss_context}"
         qa_result = qa_chain.invoke({"query": structured_query})
         answer = qa_result.get("result", "I'm sorry, I couldn't find an answer.")
         response_text = markdown.markdown(answer)
 
-    chat_history += f"Bot: {response_text}\n"
+    # Clean the bot response (remove HTML tags) before adding it to the chat history.
+    clean_response = markdown_to_plain_text(response_text)
+    chat_history += f"Bot: {clean_response}\n"
     session["chat_history"] = chat_history
 
     return jsonify(response=response_text)
