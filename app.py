@@ -4,9 +4,6 @@ import time
 import markdown
 import requests
 import httpx
-import functools
-import hashlib
-
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -24,36 +21,25 @@ from pydantic import Field
 
 load_dotenv()
 
-# --- Simple Cache Decorator ---
-cache = {}
-
-def cache_llm(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        key_raw = (args, kwargs)
-        key = hashlib.sha256(repr(key_raw).encode('utf-8')).hexdigest()
-        if key in cache:
-            return cache[key]
-        result = func(*args, **kwargs)
-        cache[key] = result
-        return result
-    return wrapper
-
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "a_very_secret_key")
 
-# MongoDB Connection
+# MongoDB Connection (consider pooling/reusing connection if under high load)
 mongodb_password = os.getenv("MONGODB_PASSWORD")
 client_mongo = MongoClient(
-    f"mongodb+srv://samratray:{mongodb_password}@cluster0.fcgztso.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    f"mongodb+srv://samratray:{mongodb_password}@cluster0.fcgztso.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
+    serverSelectionTimeoutMS=5000  # 5 seconds timeout for Mongo connection
 )
 db = client_mongo["medichat"]
 collection = db["disease_info"]
 
 def retrieve_info_from_mongo(disease_name):
-    doc = collection.find_one({"Disease": {"$regex": f"^{disease_name}$", "$options": "i"}})
-    if doc:
-        return {"disease": disease_name, "description": doc["Description"]}
+    try:
+        doc = collection.find_one({"Disease": {"$regex": f"^{disease_name}$", "$options": "i"}})
+        if doc:
+            return {"disease": disease_name, "description": doc["Description"]}
+    except Exception as e:
+        print(f"MongoDB error: {e}")
     return {"disease": None, "description": "Information not found for the given disease."}
 
 # Precompute the translation table once.
@@ -61,6 +47,7 @@ _translator = str.maketrans(string.punctuation, " " * len(string.punctuation))
 def clean_text(text: str) -> str:
     return " ".join(text.translate(_translator).split())
 
+# Convert Markdown text to plain text.
 def markdown_to_plain_text(md_text: str) -> str:
     html = markdown.markdown(md_text.strip())
     return BeautifulSoup(html, "html.parser").get_text()
@@ -69,42 +56,53 @@ def markdown_to_plain_text(md_text: str) -> str:
 def get_gradio_client(client_id: str, max_retries: int = 3, delay: int = 5):
     for attempt in range(max_retries):
         try:
-            # Optionally adjust timeout settings here if needed.
             client = Client(client_id)
             if "faiss" not in client_id.lower():
-                print(f"Loaded as API: {client_id} ✔")
+                print(f"Loaded Gradio client '{client_id}' on attempt {attempt + 1} ✔")
             return client
-        except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            print(f"Attempt {attempt + 1} for {client_id} timed out: {e}. Retrying in {delay} seconds...")
+        except httpx.ConnectTimeout as e:
+            print(f"Attempt {attempt + 1} for client '{client_id}' timed out: {e}. Retrying in {delay} seconds...")
             time.sleep(delay)
-    raise RuntimeError(f"Could not load {client_id} after {max_retries} attempts.")
+        except Exception as e:
+            print(f"Attempt {attempt + 1} for client '{client_id}' failed: {e}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+    raise RuntimeError(f"Could not load Gradio client {client_id} after {max_retries} attempts.")
 
-# Initialize Gradio clients.
+# Initialize Gradio clients for symptom and disease prediction.
 symptom_client = get_gradio_client("samratray/my_bert_space1")
 disease_client = get_gradio_client("samratray/my_bert_space2")
-faiss_client = Client("samratray/faiss")  # For FAISS search.
+
+# Initialize Gradio client for FAISS search.
+faiss_client = Client("samratray/faiss")  # No logging for FAISS client initialization.
 
 def classify_symptoms_api(text: str, threshold: float = 0.8):
-    return symptom_client.predict(text=text, threshold=threshold, api_name="/predict")
+    try:
+        return symptom_client.predict(text=text, threshold=threshold, api_name="/predict")
+    except Exception as ex:
+        print(f"Error in classify_symptoms_api: {ex}")
+        raise
 
 def predict_disease_api(detected: list, threshold: float = 0.995):
     detected_string = ", ".join(detected)
-    return disease_client.predict(
-        detected=detected_string,
-        threshold=threshold,
-        output_format="dict",
-        api_name="/predict"
-    )
+    try:
+        return disease_client.predict(
+            detected=detected_string,
+            threshold=threshold,
+            output_format="dict",
+            api_name="/predict"
+        )
+    except Exception as ex:
+        print(f"Error in predict_disease_api: {ex}")
+        raise
 
-# Define a custom LLM that uses your Gemma2 API.
+# Define a custom LLM that uses your Gemma2 API with exponential backoff.
 class Gemma2LLM(BaseLLM):
-    req_session: requests.Session = Field(default_factory=requests.Session)
+    req_session: requests.Session = Field(default_factory=lambda: requests.Session())
     
     @property
     def _llm_type(self) -> str:
         return "gemma2"
     
-    @cache_llm
     def _generate(self, prompts: list[str], stop: list[str] | None = None,
                   run_manager: CallbackManagerForLLMRun | None = None) -> LLMResult:
         api_key = os.getenv("GROQ_API_KEY")
@@ -113,31 +111,47 @@ class Gemma2LLM(BaseLLM):
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         url = "https://api.groq.com/openai/v1/chat/completions"
         generations = []
+        max_retries = 15  # Maximum retry attempts
+        
         for prompt in prompts:
-            time.sleep(0.3)  # Minimal debouncing.
-            for attempt in range(2):  # Try up to two times.
+            payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
+            attempt = 0
+            while attempt < max_retries:
                 try:
-                    payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
-                    response = self.req_session.post(url, headers=headers, json=payload)
+                    response = self.req_session.post(url, headers=headers, json=payload, timeout=10)
                     response.raise_for_status()
                     content = response.json()["choices"][0]["message"]["content"]
                     generations.append(ChatGeneration(message=AIMessage(content=content), generation_info={}))
-                    break
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 429:
-                        print(f"Rate limited. Attempt {attempt+1} for prompt: {prompt}")
-                        time.sleep(1)
+                    break  # Success
+                except requests.HTTPError as e:
+                    if response.status_code == 429:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1,2,4,8...
+                        print(f"Rate limit reached. Attempt {attempt + 1}/{max_retries}. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        attempt += 1
                     else:
-                        raise
+                        print(f"Error in Gemma2LLM _generate: {e}")
+                        generations.append(ChatGeneration(message=AIMessage(content="Error generating response."), generation_info={}))
+                        break
+                except Exception as e:
+                    print(f"Error in Gemma2LLM _generate: {e}")
+                    generations.append(ChatGeneration(message=AIMessage(content="Error generating response."), generation_info={}))
+                    break
+            else:
+                print("Max retries exhausted for prompt due to rate limiting.")
+                generations.append(ChatGeneration(message=AIMessage(content="Error: Rate limit exceeded. Please try again later."), generation_info={}))
         return LLMResult(generations=[[g] for g in generations])
     
     class Config:
         arbitrary_types_allowed = True
 
+# Instantiate LLMs.
 llm_explanation = Gemma2LLM()
 llm_for_qa = Gemma2LLM()
 
-# Dummy retriever for the QA chain.
+# ---------------------------
+# Define a Dummy Retriever to satisfy the RetrievalQA chain.
+# ---------------------------
 class DummyRetriever(BaseRetriever):
     def get_relevant_documents(self, query: str):
         return []
@@ -145,6 +159,9 @@ class DummyRetriever(BaseRetriever):
     def search_kwargs(self) -> dict:
         return {}
 
+# ---------------------------
+# Build a RetrievalQA Chain (for general queries)
+# ---------------------------
 prompt_template = (
     "Use the following context to answer the question in markdown:\n"
     "(Provide a complete answer only if the question is medically related. If the question is outside the medical field, respond with 'I am a Medical Chatbot and am not specialized in other domains. Please stick with my specialized domain.' Always strive to be as helpful as possible within your area of expertise.)\n\n"
@@ -170,25 +187,36 @@ def route_query_llm(text: str) -> dict:
     try:
         result = llm_for_qa._generate([prompt])
         decision = result.generations[0][0].message.content.strip().lower()
-    except Exception:
-        decision = "general_query"
-    if decision not in ["disease_prediction", "general_query"]:
+        if decision not in ["disease_prediction", "general_query"]:
+            print(f"Unexpected decision received: '{decision}'. Defaulting to 'general_query'.")
+            decision = "general_query"
+    except Exception as e:
+        print(f"Error in route_query_llm: {e}. Defaulting to 'general_query'.")
         decision = "general_query"
     return {"branch": decision, "query": text}
 
-def compute_decision_from_explanation(explanation: str) -> bool:
+# Updated decision function: now sending explanation, user query, and disease
+def compute_decision_from_explanation(explanation: str, user_query: str, disease: str) -> bool:
     prompt_decision = (
-        "Based on the following explanation of how the symptoms match the disease:\n\n"
+        "Based on the following details, decide if the user's symptoms sufficiently match the given disease.\n\n"
+        f"User Query: {user_query}\n"
+        f"Disease: {disease}\n"
         f"Explanation: {explanation}\n\n"
-        "Answer with a single word: Reply only 'Likely' if they do or 'Less Likely' if they do not."
+        "Answer with a single word: 'Likely' if they match or 'Less Likely' if they do not."
     )
     try:
         decision_result = llm_explanation._generate([prompt_decision])
         output = decision_result.generations[0][0].message.content.strip().lower()
     except Exception as e:
-        print(f"LLM call for decision failed: {e}")
+        print(f"Error in compute_decision_from_explanation: {e}. Defaulting to 'Less Likely'.")
         return False
-    return output.startswith("likely")
+    if output.startswith("likely"):
+        return True
+    elif output.startswith("less likely"):
+        return False
+    else:
+        print(f"Unexpected output in compute_decision_from_explanation: '{output}'. Defaulting to 'Less Likely'.")
+        return False
 
 def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) -> (str, bool):
     prompt_explanation = (
@@ -200,27 +228,30 @@ def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) ->
     try:
         explanation_result = llm_explanation._generate([prompt_explanation])
         explanation_text = explanation_result.generations[0][0].message.content.strip()
-    except Exception:
+    except Exception as e:
+        print(f"LLM call for recheck failed: {e}")
         explanation_text = "Error generating explanation."
-    decision = compute_decision_from_explanation(explanation_text)
+    decision = compute_decision_from_explanation(explanation_text, user_query, disease)
     return explanation_text, decision
 
+# ---------------------------
+# Helper: Call FAISS Space API using the Gradio client
+# ---------------------------
 def call_faiss_api(query: str) -> str:
     try:
         result = faiss_client.predict(query=query, api_name="/faiss_search")
         return result
     except Exception as e:
-        return f"Error calling FAISS API: {e}"
+        error_msg = f"Error calling FAISS API: {e}"
+        print(error_msg)
+        return error_msg
 
-# To reduce cookie size, we define a maximum message length.
-max_message_length = 300  # Adjust as needed.
-
-def truncate_message(message: str) -> str:
-    return message if len(message) <= max_message_length else message[:max_message_length] + "..."
-
+# ---------------------------
+# Flask Routes
+# ---------------------------
 @app.route("/")
 def index():
-    session["chat_history"] = []  # Initialize as an empty list.
+    session.clear()
     return render_template("index.html")
 
 @app.route("/chat", methods=["POST"])
@@ -228,19 +259,27 @@ def chat():
     user_input = request.json.get("message", "")
     cleaned_text = clean_text(user_input)
     
-    # Load the conversation history as a list.
-    chat_history = session.get("chat_history", [])
-    chat_history.append(f"User: {truncate_message(user_input)}")
+    # Clear chat history if more than 5 minutes (300 seconds) have passed.
+    now = time.time()
+    last_time = session.get("chat_history_timestamp", now)
+    if now - last_time > 300:
+        session["chat_history"] = ""
+        session["chat_history_timestamp"] = now
+        print("Chat history cleared due to timeout.")
     
-    # Use only the last five exchanges.
-    recent_history = chat_history[-5:]
-    structured_query = "Conversation History:\n" + "\n".join(recent_history) + f"\nUser Query: {truncate_message(user_input)}"
+    chat_history = session.get("chat_history", "")
+    chat_history += f"User: {user_input}\n"
     
-    if route_query_llm(user_input)["branch"] == "disease_prediction":
+    route_info = route_query_llm(user_input)
+    structured_query = f"Conversation History:\n{chat_history}\nUser Query: {user_input}"
+    response_text = ""
+    
+    if route_info["branch"] == "disease_prediction":
         try:
             raw_symptoms = classify_symptoms_api(cleaned_text)
         except Exception as ex:
             return jsonify(response=f"Error in symptom classification: {ex}")
+        
         detected_symptoms = []
         if isinstance(raw_symptoms, dict):
             if "label" in raw_symptoms and "confidences" in raw_symptoms:
@@ -252,7 +291,7 @@ def chat():
                 detected_symptoms = [item["label"] for item in raw_symptoms]
             else:
                 detected_symptoms = raw_symptoms
-
+        
         preds = []
         if detected_symptoms:
             try:
@@ -278,6 +317,7 @@ def chat():
         preds.sort(key=lambda x: not x[2])
         if preds:
             diseases_html = ""
+            sanitized_history = ""
             for disease, recheck_text, decision in preds:
                 info = retrieve_info_from_mongo(disease)
                 description_html = markdown.markdown(info["description"].strip())
@@ -291,28 +331,30 @@ def chat():
                         <div id="details-{disease}" class="disease-details" style="display:none; margin-top: 10px;">
                             <p>{description_html}</p>
                             <br/><br/>
-                            <p><strong>Recheck Explanation:</strong> {truncate_message(markdown_to_plain_text(clean_recheck_text))}</p>
+                            <p><strong>Recheck Explanation:</strong> {clean_recheck_text}</p>
                         </div>
                     </div>
                 """
+                sanitized_history += f"{disease.upper()} ({possible_str})\n"
             response_text = f"Based on your symptoms, possible conditions are:<br><br>{diseases_html}"
+            chat_history += f"Bot: {sanitized_history}\n"
         else:
             faiss_context = call_faiss_api(user_input)
             structured_query += f"\n\nContext from FAISS:\n{faiss_context}"
             qa_result = qa_chain.invoke({"query": structured_query})
             answer = qa_result.get("result", "I'm sorry, I couldn't find an answer.")
             response_text = markdown.markdown(answer)
+            chat_history += f"Bot: {markdown_to_plain_text(response_text)}\n"
     else:
         faiss_context = call_faiss_api(user_input)
         structured_query += f"\n\nContext from FAISS:\n{faiss_context}"
         qa_result = qa_chain.invoke({"query": structured_query})
         answer = qa_result.get("result", "I'm sorry, I couldn't find an answer.")
         response_text = markdown.markdown(answer)
+        chat_history += f"Bot: {markdown_to_plain_text(response_text)}\n"
     
-    # Prepare a clean version for logging and storing.
-    clean_response = markdown_to_plain_text(response_text)
-    chat_history.append(f"Bot: {truncate_message(clean_response)}")
-    session["chat_history"] = chat_history[-5:]
+    session["chat_history"] = chat_history
+    session["chat_history_timestamp"] = time.time()
     
     return jsonify(response=response_text)
 
@@ -321,5 +363,6 @@ def reset():
     session.pop("chat_history", None)
     return redirect(url_for("index"))
 
+# For production, gunicorn will load the `app` variable from this module.
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, threaded=True)
