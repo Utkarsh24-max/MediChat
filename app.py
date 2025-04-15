@@ -21,6 +21,7 @@ from pydantic import Field
 
 load_dotenv()
 
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "a_very_secret_key")
 
