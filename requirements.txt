@@ -11,3 +11,4 @@ langchain-huggingface
 langchain-community
 faiss-cpu
 pydantic
+gunicorn
