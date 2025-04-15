@@ -2,7 +2,7 @@
     "version": 2,
     "functions": {
       "api/index.py": {
-        "runtime": "python@3.9.7"
+        "runtime": "python@3.9.17"
       }
     },
     "routes": [
