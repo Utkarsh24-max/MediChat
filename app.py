@@ -163,10 +163,16 @@ class DummyRetriever(BaseRetriever):
 # Build a RetrievalQA Chain (for general queries)
 # ---------------------------
 prompt_template = (
-    "Use the following context to answer the question in markdown:\n"
-    "(Provide a complete answer only if the question is medically related. If the question is outside the medical field, respond with 'I am a Medical Chatbot and am not specialized in other domains. Please stick with my specialized domain.' Always strive to be as helpful as possible within your area of expertise.)\n\n"
-    "Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    "You are MediChat, a specialized Medical Chatbot.\n "
+    "Use the following context to answer the question in markdown. "
+    "If the question is medically related, please provide a complete and thorough answer within your expertise. "
+    "If the question falls outside the realm of medicine, respond with: "
+    "'I am a Medical Chatbot and am not specialized in other domains. Please stick with my specialized domain.'\n\n"
+    "Context:\n{context}\n\n"
+    "Question:\n{question}\n\n"
+    "Answer:"
 )
+
 QA_PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
 qa_chain = RetrievalQA.from_chain_type(
@@ -179,11 +185,15 @@ qa_chain = RetrievalQA.from_chain_type(
 
 def route_query_llm(text: str) -> dict:
     prompt = (
-        "You are a routing agent. Decide if the query is related to medical symptoms (for disease prediction) "
-        "or if it is a general query.\n"
-        f"Query: \"{text}\"\n"
-        "Respond with either 'disease_prediction' or 'general_query'."
+    "You are a routing agent. Your task is to analyze user queries and determine if the query is a request "
+    "for a disease prediction based on provided symptoms or just a general query. "
+    "Route the request to the 'disease_prediction' path only if the user appears to be asking for a diagnostic "
+    "opinion or prediction based on the symptoms they provide.\n"
+    "In all other cases, route it as a 'general_query'.\n"
+    f"Query: \"{text}\"\n"
+    "Respond with a single word: either 'disease_prediction' or 'general_query'."
     )
+
     try:
         result = llm_for_qa._generate([prompt])
         decision = result.generations[0][0].message.content.strip().lower()
