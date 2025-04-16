@@ -9,6 +9,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from gradio_client import Client
 from bs4 import BeautifulSoup  # Used to clean HTML
+import re
 
 from langchain_core.language_models import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
@@ -73,7 +74,12 @@ symptom_client = get_gradio_client("samratray/my_bert_space1")
 disease_client = get_gradio_client("samratray/my_bert_space2")
 
 # Initialize Gradio client for FAISS search.
-faiss_client = Client("samratray/faiss")  # No logging for FAISS client initialization.
+try:
+    faiss_client = get_gradio_client("samratray/faiss", max_retries=3, delay=5)
+except Exception as e:
+    print(f"Error initializing FAISS client: {e}")
+    # Optionally, you could set faiss_client to a fallback or disable FAISS functionality:
+    faiss_client = None
 
 def classify_symptoms_api(text: str, threshold: float = 0.8):
     try:
@@ -95,7 +101,7 @@ def predict_disease_api(detected: list, threshold: float = 0.995):
         print(f"Error in predict_disease_api: {ex}")
         raise
 
-# Define a custom LLM that uses your Gemma2 API with exponential backoff.
+# Define a custom LLM that uses your Gemma2 API with exponential backoff and improved error handling.
 class Gemma2LLM(BaseLLM):
     req_session: requests.Session = Field(default_factory=lambda: requests.Session())
     
@@ -111,35 +117,57 @@ class Gemma2LLM(BaseLLM):
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         url = "https://api.groq.com/openai/v1/chat/completions"
         generations = []
-        max_retries = 15  # Maximum retry attempts
+        max_retries = 15          # Maximum retry attempts
+        max_wait_time = 15        # Cap each wait to 15 seconds
+        cumulative_wait_threshold = 30  # Total allowed wait time before aborting
         
         for prompt in prompts:
             payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
             attempt = 0
+            total_wait_time = 0
             while attempt < max_retries:
                 try:
                     response = self.req_session.post(url, headers=headers, json=payload, timeout=10)
                     response.raise_for_status()
                     content = response.json()["choices"][0]["message"]["content"]
                     generations.append(ChatGeneration(message=AIMessage(content=content), generation_info={}))
-                    break  # Success
+                    break  # Success, exit the retry loop
                 except requests.HTTPError as e:
+                    # Check if we received a rate limit error (HTTP 429)
                     if response.status_code == 429:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1,2,4,8...
+                        wait_time = min(2 ** attempt, max_wait_time)
+                        total_wait_time += wait_time
+                        # Abort further retries if the cumulative wait time exceeds the threshold
+                        if total_wait_time > cumulative_wait_threshold:
+                            print("Cumulative wait time threshold exceeded. Aborting retries.")
+                            generations.append(ChatGeneration(
+                                message=AIMessage(content="Error: Rate limit exceeded. Please try again later."),
+                                generation_info={}
+                            ))
+                            break
                         print(f"Rate limit reached. Attempt {attempt + 1}/{max_retries}. Retrying in {wait_time} seconds...")
                         time.sleep(wait_time)
                         attempt += 1
                     else:
-                        print(f"Error in Gemma2LLM _generate: {e}")
-                        generations.append(ChatGeneration(message=AIMessage(content="Error generating response."), generation_info={}))
+                        print(f"HTTP error in Gemma2LLM _generate: {e}")
+                        generations.append(ChatGeneration(
+                            message=AIMessage(content="Error generating response."),
+                            generation_info={}
+                        ))
                         break
                 except Exception as e:
-                    print(f"Error in Gemma2LLM _generate: {e}")
-                    generations.append(ChatGeneration(message=AIMessage(content="Error generating response."), generation_info={}))
+                    print(f"Exception in Gemma2LLM _generate: {e}")
+                    generations.append(ChatGeneration(
+                        message=AIMessage(content="Error generating response."),
+                        generation_info={}
+                    ))
                     break
             else:
                 print("Max retries exhausted for prompt due to rate limiting.")
-                generations.append(ChatGeneration(message=AIMessage(content="Error: Rate limit exceeded. Please try again later."), generation_info={}))
+                generations.append(ChatGeneration(
+                    message=AIMessage(content="Error: Rate limit exceeded. Please try again later."),
+                    generation_info={}
+                ))
         return LLMResult(generations=[[g] for g in generations])
     
     class Config:
@@ -185,15 +213,14 @@ qa_chain = RetrievalQA.from_chain_type(
 
 def route_query_llm(text: str) -> dict:
     prompt = (
-    "You are a routing agent. Your task is to analyze user queries and determine if the query is a request "
-    "for a disease prediction based on provided symptoms or just a general query. "
-    "Route the request to the 'disease_prediction' path only if the user appears to be asking for a diagnostic "
-    "opinion or prediction based on the symptoms they provide.\n"
-    "In all other cases, route it as a 'general_query'.\n"
-    f"Query: \"{text}\"\n"
-    "Respond with a single word: either 'disease_prediction' or 'general_query'."
+        "You are a routing agent. Your task is to analyze user queries and determine if the query is a request "
+        "for a disease prediction based on provided symptoms or just a general query. "
+        "Route the request to the 'disease_prediction' path only if the user appears to be asking for a diagnostic "
+        "opinion or prediction based on the symptoms they provide.\n"
+        "In all other cases, route it as a 'general_query'.\n"
+        f"Query: \"{text}\"\n"
+        "Respond with a single word: either 'disease_prediction' or 'general_query'."
     )
-
     try:
         result = llm_for_qa._generate([prompt])
         decision = result.generations[0][0].message.content.strip().lower()
@@ -205,44 +232,49 @@ def route_query_llm(text: str) -> dict:
         decision = "general_query"
     return {"branch": decision, "query": text}
 
-# Updated decision function: now sending explanation, user query, and disease
-def compute_decision_from_explanation(explanation: str, user_query: str, disease: str) -> bool:
-    prompt_decision = (
-        "Based on the following details, decide if the user's symptoms sufficiently match the given disease.\n\n"
-        f"User Query: {user_query}\n"
-        f"Disease: {disease}\n"
-        f"Explanation: {explanation}\n\n"
-        "Answer with a single word: 'Likely' if they match or 'Less Likely' if they do not."
-    )
-    try:
-        decision_result = llm_explanation._generate([prompt_decision])
-        output = decision_result.generations[0][0].message.content.strip().lower()
-    except Exception as e:
-        print(f"Error in compute_decision_from_explanation: {e}. Defaulting to 'Less Likely'.")
-        return False
-    if output.startswith("likely"):
-        return True
-    elif output.startswith("less likely"):
-        return False
-    else:
-        print(f"Unexpected output in compute_decision_from_explanation: '{output}'. Defaulting to 'Less Likely'.")
-        return False
-
+# Updated decision function: Combined explanation and decision into a single LLM call
 def recheck_and_decide_disease(symptoms: list, disease: str, user_query: str) -> (str, bool):
-    prompt_explanation = (
-        f"How likely is the disease based on the given symptoms:\n"
-        f"User Query: {user_query}\n"
-        f"Disease: {disease}\n"
-        "Provide a brief explanation about why the disease does or does not match the symptoms."
+    prompt = (
+        f"Based on the user query, provide a brief explanation about why the disease '{disease}' does or does not match the described symptoms.\n"
+        f"User Query: {user_query}\n\n"
+        "At the end of your explanation, on a new line, output your decision in the following format exactly:\n"
+        "Answer: Yes\n"
+        "or\n"
+        "Answer: No\n"
+        "Do not include any additional text on that line."
     )
+    
     try:
-        explanation_result = llm_explanation._generate([prompt_explanation])
-        explanation_text = explanation_result.generations[0][0].message.content.strip()
+        result = llm_explanation._generate([prompt])
+        full_text = result.generations[0][0].message.content.strip()
     except Exception as e:
         print(f"LLM call for recheck failed: {e}")
-        explanation_text = "Error generating explanation."
-    decision = compute_decision_from_explanation(explanation_text, user_query, disease)
-    return explanation_text, decision
+        return ("Error generating explanation.", False)
+    
+    # Use regex to find the decision line.
+    decision_match = re.search(r"^Answer:\s*(Yes|No)\s*$", full_text, re.IGNORECASE | re.MULTILINE)
+    
+    if decision_match:
+        decision_raw = decision_match.group(1).strip().lower()
+        # Remove the decision line from the full explanation text.
+        explanation_without_decision = re.sub(r"^Answer:\s*(Yes|No)\s*$", "", full_text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    else:
+        # Fallback: if pattern is not found, attempt to extract the last word.
+        tokens = full_text.split()
+        decision_raw = tokens[-1].strip(".,").lower() if tokens else ""
+        explanation_without_decision = full_text
+    
+    # Convert yes/no to Likely or Less Likely.
+    if decision_raw == "yes":
+        decision = True  # Likely
+    elif decision_raw == "no":
+        decision = False  # Less Likely
+    else:
+        print(f"Unexpected decision output: '{decision_raw}'. Defaulting to Less Likely.")
+        decision = False
+    
+    return explanation_without_decision, decision
+
 
 # ---------------------------
 # Helper: Call FAISS Space API using the Gradio client
