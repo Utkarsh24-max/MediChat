@@ -102,6 +102,11 @@ Download trained models, preprocessing scripts, and notebooks here:
 
 [Google Drive Folder](https://drive.google.com/drive/folders/1RlgSh6kPphkHdVGlAaL9rdI86wcxuQ_I?usp=sharing)
 
+
+Link for the Data is given below:
+
+[Google Drive Folder](https://drive.google.com/drive/folders/1pjnyJg79HXMuJid4fn0O_rwIe2vW38ZW?usp=sharing)
+
 ---
 
 ## 🤝 Contributing
