@@ -17,7 +17,7 @@ from langchain_core.language_models import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.outputs import LLMResult
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
+from langchain_community.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import AIMessage, ChatGeneration, BaseRetriever, Document
 from pydantic import Field
