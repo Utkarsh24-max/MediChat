@@ -1,15 +1,17 @@
 flask
 gunicorn
+gradio
 pymongo
-requests
-httpx
-markdown
-beautifulsoup4
-python-dotenv
-gradio_client
-langchain
-langchain-core
-langchain-community
+groq
+langchain==0.2.16
+langchain-core==0.2.38
+langchain-community==0.2.7
 langchain-huggingface
 faiss-cpu
+markdown
+requests
+httpx
+beautifulsoup4
+python-dotenv
+
 
