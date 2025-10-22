@@ -10,7 +10,9 @@ from dotenv import load_dotenv
 from gradio_client import Client
 from bs4 import BeautifulSoup  # Used to clean HTML
 import re
-
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="C:\\Users\\UTKARSH ROY\\OneDrive\\Desktop\\medical\\MediChat_deployment\\.env")
 from langchain_core.language_models import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.outputs import LLMResult
@@ -122,7 +124,8 @@ class Gemma2LLM(BaseLLM):
         cumulative_wait_threshold = 30  # Total allowed wait time before aborting
         
         for prompt in prompts:
-            payload = {"model": "gemma2-9b-it", "messages": [{"role": "user", "content": prompt}]}
+            # payload = {"model": "gemma-7b-it", "messages": [{"role": "user", "content": prompt}]}
+            payload = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}]}
             attempt = 0
             total_wait_time = 0
             while attempt < max_retries:
@@ -181,12 +184,14 @@ llm_for_qa = Gemma2LLM()
 # Define a Dummy Retriever to satisfy the RetrievalQA chain.
 # ---------------------------
 class DummyRetriever(BaseRetriever):
-    def get_relevant_documents(self, query: str):
-        return []
+    def _get_relevant_documents(self, query: str):
+        # Return a dummy document to satisfy RetrievalQA
+        return [Document(page_content="This is a dummy document.")]
+    
     @property
     def search_kwargs(self) -> dict:
         return {}
-
+    
 # ---------------------------
 # Build a RetrievalQA Chain (for general queries)
 # ---------------------------
