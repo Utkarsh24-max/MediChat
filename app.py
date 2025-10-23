@@ -130,7 +130,7 @@ class Gemma2LLM(BaseLLM):
             total_wait_time = 0
             while attempt < max_retries:
                 try:
-                    response = self.req_session.post(url, headers=headers, json=payload, timeout=10)
+                    response = requests.post(url, headers=headers, json=payload, timeout=10)
                     response.raise_for_status()
                     content = response.json()["choices"][0]["message"]["content"]
                     generations.append(ChatGeneration(message=AIMessage(content=content), generation_info={}))
